@@ -7,14 +7,15 @@ from torch.nn.functional import normalize
 import copy
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 torch.autograd.set_detect_anomaly(True)
+GAMMA = 0.98
 
 env = narrow.Narrow()
 upd_policy = basic_nn.ValueNN(2, 256, 1).to(DEVICE)
 upd_queue = basic_nn.ValueNN(3, 256, 1).to(DEVICE)
 base_queue = basic_nn.ValueNN(3, 256, 1).to(DEVICE)
-skill_num = 4
-traj_len = 3
-l_r = 1e-4
+skill_num = 10
+traj_len = 11
+l_r = 1e-5
 # entropy is nore faster and flucturate, kld is less flucturate and slower
 policy_list = []
 network_p = []
@@ -96,7 +97,7 @@ while i < skill_num:
         if name == "Linear_1.bias":
             lr_q.append(l_r * 10)
         else:
-            lr_q.append(l_r)
+            lr_q.append(l_r * 1)
         lr_q.append(l_r)
         weight_decay_q.append(0.1)
     upd_queue_list.append(tmp_queue)
@@ -123,7 +124,7 @@ while iter < 1000:
         t_state = torch.from_numpy(n_state).to(DEVICE).type(torch.float32)
         l = 0
         while l < traj_len:
-            t_action = policy_list[k](t_state)
+            t_action = policy_list[k](t_state) + torch.randn(1)[0]*0.01
             input_list[k][l] = t_state
             n_action = t_action.cpu().detach().numpy()/10
             n_state, _, _ = env.step(n_action[0])
@@ -137,6 +138,8 @@ while iter < 1000:
         else:
             net_action = torch.cat((net_action, policy_list[i](input_list[i])/10), 0)
         i = i + 1
+    print(net_action.size())
+    net_action = net_action + torch.randn(skill_num * traj_len, 1).to(DEVICE)*0.01
     # net action size 110, 1
     index = (torch.arange(21).to(DEVICE) - 10) / 100
     with torch.no_grad():
@@ -152,59 +155,80 @@ while iter < 1000:
     another_out2 = input_list.reshape(-1, 2).repeat(1, len(index), 1).reshape(1, -1, 2).repeat(traj_len * skill_num, 1, 1)
     another_out = torch.clamp(another_out + another_action, min=-1, max=1)
 
-    queue_input = torch.cat((another_out2, another_action.unsqueeze(-1)), -1)
-    queue_input = queue_input.reshape(traj_len * skill_num, skill_num * traj_len, len(index), 3)
-
     reward = torch.zeros(traj_len * skill_num * len(index)).to(DEVICE)
+    final_reward = reward.reshape(traj_len * skill_num, len(index)) * 1e-4
+
     _another_out = another_out.reshape(traj_len * skill_num, traj_len * skill_num, len(index))
+
+    trans_action = torch.ones((skill_num, traj_len, 2)).to(DEVICE)
+    trans_action[:, :, -1] = net_action.reshape(skill_num, traj_len)
+    next_state = input_list + trans_action
+
+    queue_reward = torch.zeros(traj_len * skill_num).to(DEVICE)
+    tmp_action = net_action.squeeze().unsqueeze(0).repeat(traj_len * skill_num, 1)
+
     i = 0
-    loss2 = 0
-    while i < skill_num:
-        j = 0
-        while j < traj_len:
-            k = 0
-            while k < len(index):
-
-                a = upd_queue_list[i](torch.transpose(queue_input[i * traj_len + j], 0, 1)[k][i * traj_len + j])
-                with torch.no_grad():
-                    b = cal_reward_2(_another_out[i * traj_len + j].T[k], net_out, i * traj_len + j)*1e-4
-
-                loss2 = loss2 + criterion(a[0], b)
-                k = k + 1
-            j = j + 1
+    while i < traj_len * skill_num:
+        tmp_action[i][i] = 0
+        queue_reward[i] = cal_reward_2(net_out, input_list[:, :, -1].reshape(-1) + tmp_action[i], i)  # 0 to ith index?
         i = i + 1
+    queue_reward = queue_reward.reshape(skill_num, traj_len)
+    with torch.no_grad():
+        queue_input = torch.cat((input_list, net_action.reshape(skill_num, traj_len, 1)), -1)
+    skill_id = 0
+    queue_loss = 0
+    while skill_id < skill_num:
+        t_p_qvalue = upd_queue_list[skill_id](queue_input[skill_id]).squeeze()
+        next_action = policy_list[skill_id](next_state[skill_id]) / 10
+        base_queue_input = torch.cat((next_state[skill_id], next_action), -1)
+        with torch.no_grad():
+            t_qvalue = queue_reward[skill_id] * 1e-4 # + GAMMA * base_queue_list[skill_id](base_queue_input).squeeze()
+        queue_loss = queue_loss + criterion(t_p_qvalue, t_qvalue)
+        skill_id = skill_id + 1
+    print(queue_loss)
+    """
+    
+    sk_idx = 0
+    loss2 = 0
+    while sk_idx < skill_num:
+        tr_idx = 0
+        while tr_idx < traj_len:
+            idx = 0
+            while idx < len(index):
+                index_1 = idx
+                index_2 = sk_idx * traj_len + tr_idx
+                a = upd_queue_list[sk_idx](torch.transpose(queue_input[index_2], 0, 1)[index_1][index_2])
+                with torch.no_grad():
+                    b = cal_reward_2(_another_out[index_2].T[index_1], net_out, index_2)*1e-4
+                loss2 = loss2 + criterion(a[0], b)
+
+                idx = idx + 1
+            tr_idx = tr_idx + 1
+        sk_idx = sk_idx + 1
     print(loss2)
     """
-    full_idx = 0
-    while full_idx < traj_len*skill_num*len(index):
-        index_1 = int(full_idx % (len(index)))
-        index_2 = int((full_idx - index_1)/(len(index)))
-        # cal_reward_2(_another_out[index_2].T[index_1], net_out, index_2)
-
-        # cal_reward(_another_out[index_2].T[index_1])
-        full_idx = full_idx + 1
-    """
-
-    final_reward = reward.reshape(traj_len * skill_num, len(index))*1e-4
-    i = 0
-
-    while i < skill_num:
-        j = 0
-        while j < traj_len:
-            k = 0
-            while k < len(index):
+    queue_input = torch.cat((another_out2, another_action.unsqueeze(-1)), -1)
+    queue_input = queue_input.reshape(traj_len * skill_num, skill_num * traj_len, len(index), 3)
+    sk_idx = 0
+    while sk_idx < skill_num:
+        tr_idx = 0
+        while tr_idx < traj_len:
+            idx = 0
+            while idx < len(index):
+                index_1 = idx
+                index_2 = sk_idx*traj_len + tr_idx
                 with torch.no_grad():
-                    # r = upd_queue_list[i](torch.transpose(queue_input[i * traj_len + j], 0, 1)[k][i * traj_len + j])
-                    r = cal_reward_2(_another_out[i * traj_len + j].T[k], net_out, i * traj_len + j)*1e-4
-                final_reward[i * traj_len + j, k] = r
-                k = k + 1
-            j = j + 1
-        i = i + 1
+                    final_reward[index_2][index_1] = \
+                        upd_queue_list[sk_idx](torch.transpose(queue_input[index_2], 0, 1)[index_1][index_2])
+                idx = idx + 1
+            tr_idx = tr_idx + 1
+        sk_idx = sk_idx + 1
 
     prob_matrix = index.repeat(traj_len * skill_num, 1)
     prob = (-1/2)*torch.square(net_action.reshape(-1, 1).repeat(1, len(index)) - prob_matrix)
-    loss = torch.sum(torch.exp(final_reward)*(final_reward-prob))# + torch.sum(torch.exp(prob)*(prob - final_reward))
-
+    loss = torch.sum(torch.exp(prob)*(prob - final_reward))
+    # loss = torch.sum(torch.exp(final_reward)*(final_reward-prob))
+    # loss = torch.sum(torch.exp(final_reward)*(final_reward-prob)) + torch.sum(torch.exp(prob)*(prob - final_reward))
     print(torch.sort(net_out.squeeze())[0])
     optimizer_p.zero_grad()
     loss.backward(retain_graph=True)
@@ -217,7 +241,7 @@ while iter < 1000:
     optimizer_p.step()
 
     optimizer_q.zero_grad()
-    loss2.backward(retain_graph=True)
+    queue_loss.backward(retain_graph=True)
     i = 0  # seq training
     while i < len(upd_queue_list):
         for param in upd_queue_list[i].parameters():
